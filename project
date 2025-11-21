@@ -1,0 +1,169 @@
+
+!pip install -q shap pmdarima tensorflow matplotlib
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import shap
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error
+from pmdarima import auto_arima
+np.random.seed(42)
+tf.random.set_seed(42)
+
+N = 1500
+t = np.arange(N)
+data = pd.DataFrame({
+    "Power":       50 + 10*np.sin(0.02*t) + 3*np.sin(0.09*t) + np.random.normal(0,1,N),
+    "Temperature": 25 + 5*np.sin(0.015*t + 1) + np.random.normal(0,0.7,N),
+    "Humidity":    60 + 8*np.cos(0.02*t + 2) + np.random.normal(0,0.8,N),
+    "Pressure":    1000 + 3*np.sin(0.01*t) + np.random.normal(0,0.5,N)
+})
+print("Dataset shape:", data.shape)
+feature_names = list(data.columns)
+
+scaler = MinMaxScaler()
+scaled_all = scaler.fit_transform(data) 
+power_min, power_max = scaler.data_min_[0], scaler.data_max_[0]
+
+SEQ_LEN = 30
+def create_sequences(arr, seq_len=SEQ_LEN):
+    X, y = [], []
+    for i in range(len(arr) - seq_len):
+        X.append(arr[i:i+seq_len])
+        y.append(arr[i+seq_len, 0]) 
+    return np.array(X), np.array(y)
+
+X, y = create_sequences(scaled_all, SEQ_LEN)
+print("X shape:", X.shape, "y shape:", y.shape)
+
+split = int(len(X)*0.8)
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+print("Train/test sizes:", X_train.shape, X_test.shape)
+
+tf.keras.backend.clear_session()
+lstm = tf.keras.Sequential([
+    layers.Input(shape=(SEQ_LEN, X.shape[2])),
+    layers.LSTM(64, return_sequences=False),
+    layers.Dense(32, activation='relu'),
+    layers.Dense(1)
+])
+lstm.compile(optimizer='adam', loss='mse')
+print("\nTraining LSTM...")
+lstm.fit(X_train, y_train, validation_split=0.1, epochs=8, batch_size=32, verbose=1)
+
+class TransformerBlock(layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super().__init__()
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = tf.keras.Sequential([
+            layers.Dense(ff_dim, activation='relu'),
+            layers.Dense(embed_dim),
+        ])
+        self.ln1 = layers.LayerNormalization(epsilon=1e-6)
+        self.ln2 = layers.LayerNormalization(epsilon=1e-6)
+        self.drop1 = layers.Dropout(rate)
+        self.drop2 = layers.Dropout(rate)
+
+    def call(self, inputs, training=False):
+        attn_out = self.att(inputs, inputs)
+        attn_out = self.drop1(attn_out, training=training)
+        out1 = self.ln1(inputs + attn_out)
+        ffn_out = self.ffn(out1)
+        ffn_out = self.drop2(ffn_out, training=training)
+        return self.ln2(out1 + ffn_out)
+
+embed_dim = 64
+num_heads = 4
+ff_dim = 128
+
+inputs = layers.Input(shape=(SEQ_LEN, X.shape[2]))
+x = layers.Dense(embed_dim)(inputs)               
+x = TransformerBlock(embed_dim, num_heads, ff_dim)(x)
+x = layers.GlobalAveragePooling1D()(x)
+x = layers.Dense(64, activation='relu')(x)
+out = layers.Dense(1)(x)
+
+transformer = Model(inputs, out)
+transformer.compile(optimizer='adam', loss='mse')
+print("\nTraining Transformer...")
+transformer.fit(X_train, y_train, epochs=6, batch_size=32, verbose=1)
+
+def walk_forward_predict(model, X_test):
+    preds = []
+    for i in range(len(X_test)):
+        p = model.predict(X_test[i:i+1], verbose=0)[0][0]
+        preds.append(p)
+    return np.array(preds)
+
+lstm_preds = walk_forward_predict(lstm, X_test)
+trans_preds = walk_forward_predict(transformer, X_test)
+
+print("\nLSTM MAE (scaled):", mean_absolute_error(y_test, lstm_preds))
+print("Transformer MAE (scaled):", mean_absolute_error(y_test, trans_preds))
+
+print("\nFitting ARIMA (this may take a short while)...")
+arima = auto_arima(data["Power"].values, seasonal=False, error_action="ignore", suppress_warnings=True)
+arima_pred_orig = arima.predict(n_periods=len(y_test))  
+
+arima_pred_scaled = (arima_pred_orig - power_min) / (power_max - power_min)
+arima_pred_scaled = np.asarray(arima_pred_scaled).reshape(-1)
+print("ARIMA MAE (scaled):", mean_absolute_error(y_test, arima_pred_scaled))
+
+plt.figure(figsize=(14,5))
+nplot = min(300, len(y_test))
+plt.plot(y_test[:nplot], label='True (scaled)', linewidth=1)
+plt.plot(lstm_preds[:nplot], label='LSTM (scaled)', linewidth=1)
+plt.plot(trans_preds[:nplot], label='Transformer (scaled)', linewidth=1)
+plt.plot(arima_pred_scaled[:nplot], label='ARIMA (scaled)', linewidth=1)
+plt.legend()
+plt.title("Forecast Comparison (scaled)")
+plt.show()
+
+print("\nComputing SHAP (KernelExplainer). This may take ~30-90s depending on nsamples and Colab CPU.")
+shap.initjs()
+
+bg_n = min(50, X_train.shape[0])
+sample_n = min(80, X_test.shape[0])
+background = X_train[:bg_n].reshape(bg_n, -1)
+samples = X_test[:sample_n].reshape(sample_n, -1)
+
+def model_predict_flat(x_flat):
+    reshaped = x_flat.reshape(-1, SEQ_LEN, X.shape[2]).astype(np.float32)
+    return lstm.predict(reshaped, verbose=0).flatten()
+
+explainer = shap.KernelExplainer(model_predict_flat, background)
+
+shap_values = explainer.shap_values(samples, nsamples=100) 
+
+shap_arr = np.array(shap_values)
+if shap_arr.ndim == 1:
+    shap_arr = shap_arr.reshape(1, -1)
+
+shap_reshaped = shap_arr.reshape(samples.shape[0], SEQ_LEN, X.shape[2])
+abs_shap = np.mean(np.abs(shap_reshaped), axis=0)  
+
+plt.figure(figsize=(9,6))
+im = plt.imshow(abs_shap, aspect='auto', interpolation='nearest')
+plt.colorbar(im, fraction=0.045, pad=0.04)
+plt.ylabel("Timestep in sequence (0 = oldest, {})".format(SEQ_LEN-1))
+plt.xlabel("Feature")
+plt.xticks(range(len(feature_names)), feature_names, rotation=45)
+plt.title("SHAP heatmap (mean |SHAP| over samples) — Timesteps × Features")
+plt.show()
+
+mean_per_feature = abs_shap.sum(axis=0)
+plt.figure(figsize=(6,4))
+plt.bar(feature_names, mean_per_feature)
+plt.title("Aggregated SHAP importance per feature (sum over timesteps)")
+plt.ylabel("Sum |SHAP|")
+plt.show()
+
+print("\nDone — LSTM, Transformer, ARIMA, walk-forward, and SHAP heatmap completed.")
+
